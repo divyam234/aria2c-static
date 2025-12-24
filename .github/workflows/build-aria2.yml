@@ -1,0 +1,61 @@
+name: Build and Release Aria2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Aria2 for ${{ matrix.arch }}
+        run: |
+          docker buildx build --platform linux/${{ matrix.arch }} \
+            --output "type=local,dest=./output" \
+            --build-arg TARGETARCH=${{ matrix.arch }} .
+
+      - name: Compress artifact
+        run: |
+          mkdir -p ./artifacts
+          mv ./output/aria2c ./artifacts/aria2c
+          cd ./artifacts
+          tar -czvf aria2-linux-${{ matrix.arch }}.tar.gz aria2c
+          rm aria2c
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aria2-linux-${{ matrix.arch }}
+          path: ./artifacts/aria2-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Get latest release tag
+        id: get_tag
+        run: |
+          echo "RELEASE_TAG=$(curl -s https://api.github.com/repos/aria2/aria2/releases/latest | jq -r .tag_name)" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_tag.outputs.RELEASE_TAG }}
+          name: Aria2 ${{ steps.get_tag.outputs.RELEASE_TAG }}
+          draft: false
+          prerelease: false
+          files: |
+            ./aria2-linux-amd64/aria2-linux-amd64.tar.gz
+            ./aria2-linux-arm64/aria2-linux-arm64.tar.gz
