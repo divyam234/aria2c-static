@@ -1,4 +1,4 @@
-FROM debian:bullseye AS builder
+FROM ubuntu:22.04 AS builder
 
 # Install basic build tools
 RUN apt-get update && apt-get install -y \
