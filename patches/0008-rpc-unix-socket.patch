@@ -1,0 +1,516 @@
+From 63dd48a7056bb44727b5a2f3f01002345c899560 Mon Sep 17 00:00:00 2001
+From: divyam234 <47589864+divyam234@users.noreply.github.com>
+Date: Sat, 30 May 2026 13:53:52 +0530
+Subject: [PATCH] Add --rpc-listen-socket option for Unix domain socket RPC
+
+Adds support for listening on a Unix domain socket for JSON-RPC/XML-RPC
+connections, as an alternative to TCP port listening.
+
+New option:
+  --rpc-listen-socket=PATH  Specify a Unix domain socket path for
+                            JSON-RPC/XML-RPC server to listen to.
+
+- New SocketCore::bindUnixSocket() creates and binds AF_UNIX socket,
+  automatically removing any existing socket file at the path
+- New UnixListenCommand class, analogous to HttpListenCommand,
+  accepts connections and passes them to HttpServerCommand
+- When --rpc-listen-socket is specified, TCP port listening is skipped
+  (--rpc-listen-port and --rpc-listen-socket are mutually exclusive)
+- Socket file is cleaned up on shutdown
+- Guarded with HAVE_SYS_UN_H for platforms without Unix socket support
+---
+ configure.ac                 |   7 +-
+ src/DownloadEngineFactory.cc |  51 +++++++++++---
+ src/Makefile.am              |   1 +
+ src/OptionHandlerFactory.cc  |   6 ++
+ src/SocketCore.cc            |  57 +++++++++++++++
+ src/SocketCore.h             |  12 ++++
+ src/UnixListenCommand.cc     | 131 +++++++++++++++++++++++++++++++++++
+ src/UnixListenCommand.h      |  68 ++++++++++++++++++
+ src/prefs.cc                 |   1 +
+ src/prefs.h                  |   2 +
+ src/usage_text.h             |   3 +
+ 11 files changed, 326 insertions(+), 13 deletions(-)
+ create mode 100644 src/UnixListenCommand.cc
+ create mode 100644 src/UnixListenCommand.h
+
+diff --git a/configure.ac b/configure.ac
+index 98439946..09603eb1 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -686,9 +686,10 @@ AC_CHECK_HEADERS([argz.h \
+                   sys/signal.h \
+                   sys/socket.h \
+                   sys/time.h \
+-                  sys/types.h \
+-                  sys/uio.h \
+-                  sys/utsname.h \
++                   sys/types.h \
++                   sys/uio.h \
++                   sys/un.h \
++                   sys/utsname.h \
+                   termios.h \
+                   unistd.h \
+                   utime.h \
+diff --git a/src/DownloadEngineFactory.cc b/src/DownloadEngineFactory.cc
+index da45dff1..a7b33a8f 100644
+--- a/src/DownloadEngineFactory.cc
++++ b/src/DownloadEngineFactory.cc
+@@ -77,6 +77,9 @@
+ #include "DlAbortEx.h"
+ #include "FileAllocationEntry.h"
+ #include "HttpListenCommand.h"
++#ifdef HAVE_SYS_UN_H
++#  include "UnixListenCommand.h"
++#endif // HAVE_SYS_UN_H
+ #include "LogFactory.h"
+ 
+ namespace aria2 {
+@@ -200,22 +203,50 @@ std::unique_ptr<DownloadEngine> DownloadEngineFactory::newDownloadEngine(
+                   "recommended to specify --rpc-secret with the adequate "
+                   "secrecy or now deprecated --rpc-user and --rpc-passwd.");
+     }
+-    bool ok = false;
+     bool secure = op->getAsBool(PREF_RPC_SECURE);
+     if (secure) {
+       A2_LOG_NOTICE("RPC transport will be encrypted.");
+     }
+-    static int families[] = {AF_INET, AF_INET6};
+-    size_t familiesLength = op->getAsBool(PREF_DISABLE_IPV6) ? 1 : 2;
+-    for (size_t i = 0; i < familiesLength; ++i) {
+-      auto httpListenCommand = make_unique<HttpListenCommand>(
+-          e->newCUID(), e.get(), families[i], secure);
+-      if (httpListenCommand->bindPort(op->getAsInt(PREF_RPC_LISTEN_PORT))) {
+-        e->addCommand(std::move(httpListenCommand));
+-        ok = true;
++
++    auto rpcListenSocket = op->get(PREF_RPC_LISTEN_SOCKET);
++    bool hasUnixSocket = !rpcListenSocket.empty();
++
++    // Try Unix socket listener if specified
++#ifdef HAVE_SYS_UN_H
++    bool unixOk = false;
++    if (hasUnixSocket) {
++      auto unixListenCommand = make_unique<UnixListenCommand>(
++          e->newCUID(), e.get(), rpcListenSocket, secure);
++      if (unixListenCommand->bindSocket()) {
++        e->addCommand(std::move(unixListenCommand));
++        unixOk = true;
++      }
++      else {
++        A2_LOG_ERROR("Failed to setup RPC Unix socket listener.");
+       }
+     }
+-    if (!ok) {
++#endif // HAVE_SYS_UN_H
++
++    // Try TCP listener only if no Unix socket was requested
++    bool tcpOk = false;
++    if (!hasUnixSocket) {
++      static int families[] = {AF_INET, AF_INET6};
++      size_t familiesLength = op->getAsBool(PREF_DISABLE_IPV6) ? 1 : 2;
++      for (size_t i = 0; i < familiesLength; ++i) {
++        auto httpListenCommand = make_unique<HttpListenCommand>(
++            e->newCUID(), e.get(), families[i], secure);
++        if (httpListenCommand->bindPort(op->getAsInt(PREF_RPC_LISTEN_PORT))) {
++          e->addCommand(std::move(httpListenCommand));
++          tcpOk = true;
++        }
++      }
++    }
++
++    if (!tcpOk
++#ifdef HAVE_SYS_UN_H
++        && !unixOk
++#endif
++    ) {
+       throw DL_ABORT_EX("Failed to setup RPC server.");
+     }
+   }
+diff --git a/src/Makefile.am b/src/Makefile.am
+index cb6e3b7c..7593f3f4 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -123,6 +123,7 @@ SRCS =  \
+ 	HttpHeaderProcessor.cc HttpHeaderProcessor.h\
+ 	HttpInitiateConnectionCommand.cc HttpInitiateConnectionCommand.h\
+ 	HttpListenCommand.cc HttpListenCommand.h\
++	UnixListenCommand.cc UnixListenCommand.h\
+ 	HttpProxyRequestCommand.cc HttpProxyRequestCommand.h\
+ 	HttpProxyRequestConnectChain.h\
+ 	HttpProxyResponseCommand.cc HttpProxyResponseCommand.h\
+diff --git a/src/OptionHandlerFactory.cc b/src/OptionHandlerFactory.cc
+index 000426b6..a7f5073e 100644
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -770,6 +770,12 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
+     op->addTag(TAG_RPC);
+     handlers.push_back(op);
+   }
++  {
++    OptionHandler* op(new DefaultOptionHandler(
++        PREF_RPC_LISTEN_SOCKET, TEXT_RPC_LISTEN_SOCKET, NO_DEFAULT_VALUE));
++    op->addTag(TAG_RPC);
++    handlers.push_back(op);
++  }
+   {
+     OptionHandler* op(new UnitNumberOptionHandler(
+         PREF_RPC_MAX_REQUEST_SIZE, TEXT_RPC_MAX_REQUEST_SIZE, "2M", 0));
+diff --git a/src/SocketCore.cc b/src/SocketCore.cc
+index 4e7421bc..d08f84c3 100644
+--- a/src/SocketCore.cc
++++ b/src/SocketCore.cc
+@@ -49,6 +49,10 @@
+ #include <sstream>
+ #include <array>
+ 
++#ifdef HAVE_SYS_UN_H
++#  include <sys/un.h>
++#endif // HAVE_SYS_UN_H
++
+ #include "message.h"
+ #include "DlRetryEx.h"
+ #include "DlAbortEx.h"
+@@ -360,6 +364,59 @@ void SocketCore::bind(const struct sockaddr* addr, socklen_t addrlen)
+   sockfd_ = fd;
+ }
+ 
++#ifdef HAVE_SYS_UN_H
++
++void SocketCore::bindUnixSocket(const std::string& path)
++{
++  closeConnection();
++
++  if (path.size() >= sizeof(sockaddr_un::sun_path)) {
++    throw DL_ABORT_EX(
++        fmt("Unix socket path too long: %lu bytes max %lu",
++            static_cast<unsigned long>(path.size()),
++            static_cast<unsigned long>(sizeof(sockaddr_un::sun_path))));
++  }
++
++  // Remove existing socket file
++  if (a2unlink(path.c_str()) == -1 && errno != ENOENT) {
++    int errNum = errno;
++    A2_LOG_WARN(fmt("Failed to remove existing Unix socket file %s: %s",
++                    path.c_str(), util::safeStrerror(errNum).c_str()));
++  }
++
++  sock_t fd = socket(AF_UNIX, sockType_, 0);
++  if (fd == (sock_t)-1) {
++    int errNum = errno;
++    throw DL_ABORT_EX(fmt("Failed to create Unix socket: %s",
++                          util::safeStrerror(errNum).c_str()));
++  }
++  util::make_fd_cloexec(fd);
++
++  // SO_REUSEADDR is silently ignored on most platforms for AF_UNIX
++  int sockopt = 1;
++  (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (a2_sockopt_t)&sockopt,
++                   sizeof(sockopt));
++
++  applySocketBufferSize(fd);
++
++  struct sockaddr_un addr;
++  memset(&addr, 0, sizeof(addr));
++  addr.sun_family = AF_UNIX;
++  strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
++  addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
++
++  if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
++    int errNum = errno;
++    CLOSE(fd);
++    throw DL_ABORT_EX(fmt("Failed to bind Unix socket %s: %s", path.c_str(),
++                          util::safeStrerror(errNum).c_str()));
++  }
++
++  sockfd_ = fd;
++}
++
++#endif // HAVE_SYS_UN_H
++
+ void SocketCore::beginListen()
+ {
+   if (listen(sockfd_, 1024) == -1) {
+diff --git a/src/SocketCore.h b/src/SocketCore.h
+index 60f33279..38c7fdb1 100644
+--- a/src/SocketCore.h
++++ b/src/SocketCore.h
+@@ -48,6 +48,10 @@
+ #include "a2netcompat.h"
+ #include "a2time.h"
+ 
++#ifdef __MINGW32__
++#  undef HAVE_SYS_UN_H
++#endif // __MINGW32__
++
+ namespace aria2 {
+ 
+ #ifdef ENABLE_SSL
+@@ -162,6 +166,14 @@ public:
+   void bind(const char* addrp, uint16_t port, int family,
+             int flags = AI_PASSIVE);
+ 
++#ifdef HAVE_SYS_UN_H
++  /**
++   * Binds to a Unix domain socket at the given path.
++   * Removes any existing socket file at path before binding.
++   */
++  void bindUnixSocket(const std::string& path);
++#endif // HAVE_SYS_UN_H
++
+   /**
+    * Listens form connection on it.
+    * Call bind(uint16_t) before calling this function.
+diff --git a/src/UnixListenCommand.cc b/src/UnixListenCommand.cc
+new file mode 100644
+index 00000000..b5b89571
+--- /dev/null
++++ b/src/UnixListenCommand.cc
+@@ -0,0 +1,131 @@
++/* <!-- copyright */
++/*
++ * aria2 - The high speed download utility
++ *
++ * Copyright (C) 2009 Tatsuhiro Tsujikawa
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ * In addition, as a special exception, the copyright holders give
++ * permission to link the code of portions of this program with the
++ * OpenSSL library under certain conditions as described in each
++ * individual source file, and distribute linked combinations
++ * including the two.
++ * You must obey the GNU General Public License in all respects
++ * for all of the code used other than OpenSSL.  If you modify
++ * file(s) with this exception, you may extend this exception to your
++ * version of the file(s), but you are not obligated to do so.  If you
++ * do not wish to do so, delete this exception statement from your
++ * version.  If you delete this exception statement from all source
++ * files in the program, then also delete it here.
++ */
++/* copyright --> */
++#include "UnixListenCommand.h"
++
++#ifdef HAVE_SYS_UN_H
++#  include <sys/un.h>
++#endif // HAVE_SYS_UN_H
++
++#include "DownloadEngine.h"
++#include "RecoverableException.h"
++#include "message.h"
++#include "Logger.h"
++#include "LogFactory.h"
++#include "SocketCore.h"
++#include "HttpServerCommand.h"
++#include "CUIDCounter.h"
++#include "RequestGroupMan.h"
++#include "prefs.h"
++#include "Option.h"
++#include "A2STR.h"
++#include "a2io.h"
++#include "fmt.h"
++
++namespace aria2 {
++
++UnixListenCommand::UnixListenCommand(cuid_t cuid, DownloadEngine* e,
++                                     std::string path, bool secure)
++    : Command(cuid),
++      e_(e),
++      socketPath_(std::move(path)),
++      secure_(secure)
++{
++}
++
++UnixListenCommand::~UnixListenCommand()
++{
++  if (serverSocket_) {
++    e_->deleteSocketForReadCheck(serverSocket_, this);
++  }
++#ifdef HAVE_SYS_UN_H
++  if (!socketPath_.empty()) {
++    a2unlink(socketPath_.c_str());
++  }
++#endif // HAVE_SYS_UN_H
++}
++
++bool UnixListenCommand::execute()
++{
++  if (e_->getRequestGroupMan()->downloadFinished() || e_->isHaltRequested()) {
++    return true;
++  }
++  try {
++    if (serverSocket_->isReadable(0)) {
++      std::shared_ptr<SocketCore> socket(serverSocket_->acceptConnection());
++
++      A2_LOG_INFO("RPC: Accepted the connection on Unix socket.");
++
++      e_->setNoWait(true);
++      e_->addCommand(
++          make_unique<HttpServerCommand>(e_->newCUID(), e_, socket, secure_));
++    }
++  }
++  catch (RecoverableException& e) {
++    A2_LOG_DEBUG_EX(fmt(MSG_ACCEPT_FAILURE, getCuid()), e);
++  }
++  e_->addCommand(std::unique_ptr<Command>(this));
++  return false;
++}
++
++bool UnixListenCommand::bindSocket()
++{
++  if (serverSocket_) {
++    e_->deleteSocketForReadCheck(serverSocket_, this);
++  }
++  serverSocket_ = std::make_shared<SocketCore>();
++#ifdef HAVE_SYS_UN_H
++  try {
++    serverSocket_->bindUnixSocket(socketPath_);
++    serverSocket_->beginListen();
++    A2_LOG_INFO(fmt(MSG_LISTENING_PORT, getCuid(), 0));
++    e_->addSocketForReadCheck(serverSocket_, this);
++    A2_LOG_NOTICE(fmt("RPC: listening on Unix socket %s",
++                      socketPath_.c_str()));
++    return true;
++  }
++  catch (RecoverableException& e) {
++    A2_LOG_ERROR_EX(fmt("RPC: failed to bind Unix socket %s",
++                        socketPath_.c_str()),
++                    e);
++    serverSocket_->closeConnection();
++  }
++#else  // !HAVE_SYS_UN_H
++  A2_LOG_ERROR("Unix socket support is not available on this platform.");
++  (void)e_;
++#endif // !HAVE_SYS_UN_H
++  return false;
++}
++
++} // namespace aria2
+diff --git a/src/UnixListenCommand.h b/src/UnixListenCommand.h
+new file mode 100644
+index 00000000..25d00b1b
+--- /dev/null
++++ b/src/UnixListenCommand.h
+@@ -0,0 +1,68 @@
++/* <!-- copyright */
++/*
++ * aria2 - The high speed download utility
++ *
++ * Copyright (C) 2009 Tatsuhiro Tsujikawa
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ * In addition, as a special exception, the copyright holders give
++ * permission to link the code of portions of this program with the
++ * OpenSSL library under certain conditions as described in each
++ * individual source file, and distribute linked combinations
++ * including the two.
++ * You must obey the GNU General Public License in all respects
++ * for all of the code used other than OpenSSL.  If you modify
++ * file(s) with this exception, you may extend this exception to your
++ * version of the file(s), but you are not obligated to do so.  If you
++ * do not wish to do so, delete this exception statement from your
++ * version.  If you delete this exception statement from all source
++ * files in the program, then also delete it here.
++ */
++/* copyright --> */
++#ifndef D_UNIX_LISTEN_COMMAND_H
++#define D_UNIX_LISTEN_COMMAND_H
++
++#include "Command.h"
++
++#include <memory>
++#include <string>
++
++namespace aria2 {
++
++class DownloadEngine;
++class SocketCore;
++
++class UnixListenCommand : public Command {
++private:
++  DownloadEngine* e_;
++  std::shared_ptr<SocketCore> serverSocket_;
++  std::string socketPath_;
++  bool secure_;
++
++public:
++  UnixListenCommand(cuid_t cuid, DownloadEngine* e, std::string path,
++                    bool secure);
++
++  virtual ~UnixListenCommand();
++
++  virtual bool execute() CXX11_OVERRIDE;
++
++  bool bindSocket();
++};
++
++} // namespace aria2
++
++#endif // D_UNIX_LISTEN_COMMAND_H
+diff --git a/src/prefs.cc b/src/prefs.cc
+index 2591b9f0..be0347e4 100644
+--- a/src/prefs.cc
++++ b/src/prefs.cc
+@@ -276,6 +276,7 @@ PrefPtr PREF_RPC_PASSWD = makePref("rpc-passwd");
+ PrefPtr PREF_RPC_MAX_REQUEST_SIZE = makePref("rpc-max-request-size");
+ // value: true | false
+ PrefPtr PREF_RPC_LISTEN_ALL = makePref("rpc-listen-all");
++PrefPtr PREF_RPC_LISTEN_SOCKET = makePref("rpc-listen-socket");
+ // value: true | false
+ PrefPtr PREF_RPC_ALLOW_ORIGIN_ALL = makePref("rpc-allow-origin-all");
+ // value: string that your file system recognizes as a file name.
+diff --git a/src/prefs.h b/src/prefs.h
+index 338fd6e6..16be9403 100644
+--- a/src/prefs.h
++++ b/src/prefs.h
+@@ -229,6 +229,8 @@ extern PrefPtr PREF_RPC_PASSWD;
+ extern PrefPtr PREF_RPC_MAX_REQUEST_SIZE;
+ // value: true | false
+ extern PrefPtr PREF_RPC_LISTEN_ALL;
++// value: string that your file system recognizes as a file name.
++extern PrefPtr PREF_RPC_LISTEN_SOCKET;
+ // value: true | false
+ extern PrefPtr PREF_RPC_ALLOW_ORIGIN_ALL;
+ // value: string that your file system recognizes as a file name.
+diff --git a/src/usage_text.h b/src/usage_text.h
+index 08715436..53e7f9f2 100644
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -844,6 +844,9 @@
+ #define TEXT_RPC_LISTEN_PORT                                        \
+   _(" --rpc-listen-port=PORT       Specify a port number for JSON-RPC/XML-RPC server\n" \
+     "                              to listen to.")
++#define TEXT_RPC_LISTEN_SOCKET                                           \
++  _(" --rpc-listen-socket=PATH     Specify a Unix domain socket path for JSON-RPC/XML-RPC\n" \
++    "                              server to listen to.")
+ #define TEXT_SHOW_CONSOLE_READOUT                                       \
+   _(" --show-console-readout[=true|false] Show console readout.")
+ #define TEXT_METALINK_BASE_URI                  \
+-- 
+2.54.0
+

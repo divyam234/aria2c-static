@@ -106,8 +106,17 @@ jobs:
     needs: [extract-binaries, resolve-tag]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download amd64 artifact
         uses: actions/download-artifact@v4
+        with:
+          name: aria2-linux-amd64
+          path: ./aria2-linux-amd64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aria2-linux-arm64
+          path: ./aria2-linux-arm64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
